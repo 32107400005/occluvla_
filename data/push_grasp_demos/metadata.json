@@ -1,0 +1,7 @@
+{
+  "num_episodes": 100,
+  "total_success": 0,
+  "success_rate": 0.0,
+  "avg_steps": 43.33,
+  "total_time_sec": 89.00228643417358
+}

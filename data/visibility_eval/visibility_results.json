@@ -1,0 +1,46 @@
+{
+  "basic": {
+    "total": 45,
+    "detected": 26,
+    "rate": 0.5777777777777777,
+    "avg_conf": 0.26154145465956796
+  },
+  "occlusion_levels": {
+    "0%": {
+      "occlusion": 0.0,
+      "detected": 20,
+      "total": 20,
+      "rate": 1.0,
+      "avg_conf": 0.5261684969067574
+    },
+    "25%": {
+      "occlusion": 0.25,
+      "detected": 20,
+      "total": 20,
+      "rate": 1.0,
+      "avg_conf": 0.4169951379299164
+    },
+    "50%": {
+      "occlusion": 0.5,
+      "detected": 20,
+      "total": 20,
+      "rate": 1.0,
+      "avg_conf": 0.4411691173911095
+    },
+    "75%": {
+      "occlusion": 0.75,
+      "detected": 20,
+      "total": 20,
+      "rate": 1.0,
+      "avg_conf": 0.4746450990438461
+    },
+    "100%": {
+      "occlusion": 1.0,
+      "detected": 20,
+      "total": 20,
+      "rate": 1.0,
+      "avg_conf": 0.5536040991544724
+    }
+  },
+  "timestamp": "2026-03-12 23:52:37"
+}
