@@ -1,0 +1,7 @@
+# Generated dataset artifacts
+data/push_grasp_demos/
+data/visualizations/
+
+# Python cache files
+__pycache__/
+*.pyc
