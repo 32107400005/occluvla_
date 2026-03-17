@@ -1,22 +1,25 @@
 """
-OccluVLA - Push-Then-Grasp 环境封装 (基于诊断结果确认的 API)
+OccluVLA - Push-Then-Grasp 环境封装 (基于 OccluBench 自定义环境)
 
-确认的 API (PickClutterYCB-v1):
-  EE 位置:       env.unwrapped.agent.tcp.pose.p          → (1,3)
-  所有物体位置:   env.unwrapped.all_objects.pose.p        → (N,3)
-  Target 物体:   env.unwrapped.target_object              → Actor
-  Goal 位置:     env.unwrapped.goal_pos                   → tensor
-  Segmentation:  env.unwrapped.segmentation_id_map        → {id: Actor/Link}
-  Action:        7-DoF pd_ee_delta_pose [dx,dy,dz, drx,dry,drz, gripper]
-  机器人 base:   x=-0.615, y=0
-  默认 base_cam: pos=[0.3, 0, 0.6] → 对面(作弊!), 仅用于 debug
+底层环境: OccluBench-Level1-v0 / OccluBench-Level2-v0
+  shoulder_camera: 固定在机器人后上方 (通过 ManiSkill3 sensor_configs)
+  hand_camera:     mount 到 panda_hand TCP link (通过 _after_loading)
+
+API:
+  EE 位置:        env.unwrapped.agent.tcp.pose.p
+  Target 物体:    env.unwrapped.target_object
+  Occluder 列表:  env.unwrapped.occluder_objects
+  All 物体:       env.unwrapped.all_objects
+  Action:         7-DoF pd_ee_delta_pose [dx,dy,dz, drx,dry,drz, gripper]
+  机器人 base:    x=-0.615, y=0
 """
 
 import numpy as np
 import torch
 import gymnasium as gym
-import mani_skill.envs
-from mani_skill.utils.structs import Actor
+
+# 注册 OccluBench 环境 (import 触发 @register_env)
+import occlubench_env  # noqa: F401
 
 
 def to_np(x):
@@ -25,24 +28,64 @@ def to_np(x):
     return np.asarray(x)
 
 
-class OccluVLAEnv:
+# 相机名常量 — 与 occlubench_env 中定义的一致
+CAM_SHOULDER = "shoulder_camera"
+CAM_HAND     = "hand_camera"
 
-    def __init__(self, num_envs=1, max_episode_steps=200, render_size=512):
+
+class OccluVLAEnv:
+    """
+    封装 OccluBench 环境，提供:
+      - 双相机图像提取 (shoulder + hand, 按相机分开)
+      - target / occluder 位置读取
+      - 统一的 step / reset 接口
+    """
+
+    def __init__(
+        self,
+        level: int = 1,
+        num_envs: int = 1,
+        max_episode_steps: int = 200,
+        render_size: int = 256,
+    ):
         self.render_size = render_size
+        self.level = level
+
+        env_id = f"OccluBench-Level{level}-v0"
+        if level == 2:
+            max_episode_steps = max(max_episode_steps, 300)
+
         self.env = gym.make(
-            "PickClutterYCB-v1",
+            env_id,
             obs_mode="rgbd",
             control_mode="pd_ee_delta_pose",
             render_mode="rgb_array",
             num_envs=num_envs,
             max_episode_steps=max_episode_steps,
-            sensor_configs=dict(
-                base_camera=dict(width=render_size, height=render_size),
-            ),
         )
         self.base_env = self.env.unwrapped
         self.action_dim = 7
-        print(f"  Env: PickClutterYCB-v1 | action_dim={self.action_dim} | render={render_size}")
+
+        # ── 探测可用相机 ─────────────────────────────────────────
+        self._available_cams = []
+        test_obs, _ = self.env.reset(seed=0)
+        sd = test_obs.get('sensor_data', {})
+        for cam_name in [CAM_SHOULDER, CAM_HAND]:
+            if cam_name in sd and isinstance(sd[cam_name], dict):
+                self._available_cams.append(cam_name)
+        # 如果自定义相机名不在 sensor_data 中，回退检测所有
+        if not self._available_cams:
+            for k in sd:
+                if isinstance(sd[k], dict) and 'rgb' in sd[k]:
+                    self._available_cams.append(k)
+
+        print(f"  Env: {env_id} | action_dim={self.action_dim} "
+              f"| render={render_size}")
+        print(f"  Available cameras: {self._available_cams}")
+
+    @property
+    def camera_names(self) -> list:
+        return list(self._available_cams)
 
     def reset(self, seed=None):
         return self.env.reset(seed=seed)
@@ -54,78 +97,93 @@ class OccluVLAEnv:
             action = action.unsqueeze(0)
         return self.env.step(action)
 
-    # ── 真实位置 (从诊断确认的 API) ──────────────────────────────
+    # ── 位置读取 ─────────────────────────────────────────────────
     def get_ee_pos(self):
         p = to_np(self.base_env.agent.tcp.pose.p)
         return p[0] if p.ndim > 1 else p
 
+    def get_target_object(self):
+        """返回 {'name': str, 'pos': np.array(3), 'ycb_id': str}"""
+        tgt = self.base_env.target_object
+        p = to_np(tgt.pose.p)
+        if p.ndim > 1: p = p[0]
+        return {
+            'name': tgt.name,
+            'pos': p,
+            'ycb_id': self.base_env.target_ycb_id,
+        }
+
+    def get_occluder_objects(self):
+        """返回 [{'name': str, 'pos': np.array(3), 'ycb_id': str}, ...]"""
+        occluders = self.base_env.occluder_objects
+        ycb_ids = self.base_env.occluder_ycb_ids
+        result = []
+        for occ, yid in zip(occluders, ycb_ids):
+            p = to_np(occ.pose.p)
+            if p.ndim > 1: p = p[0]
+            result.append({'name': occ.name, 'pos': p, 'ycb_id': yid})
+        return result
+
     def get_all_object_poses(self):
+        """所有动态物体的名称和位置"""
         objects = []
-        for seg_id, obj in self.base_env.segmentation_id_map.items():
-            if not isinstance(obj, Actor):
-                continue
-            if any(s in obj.name for s in ['table', 'ground', 'goal']):
-                continue
+        for obj in self.base_env.all_objects:
             p = to_np(obj.pose.p)
             if p.ndim > 1: p = p[0]
-            objects.append({'seg_id': seg_id, 'name': obj.name, 'pos': p})
+            objects.append({'name': obj.name, 'pos': p})
         return objects
 
-    def get_target_object(self):
-        try:
-            tgt = self.base_env.target_object
-            p = to_np(tgt.pose.p)
-            if p.ndim > 1: p = p[0]
-            return {'name': tgt.name, 'pos': p}
-        except:
-            return self._find_target_by_goal()
-
-    def _find_target_by_goal(self):
-        try:
-            gp = to_np(self.base_env.goal_site.pose.p)
-            if gp.ndim > 1: gp = gp[0]
-        except:
+    def find_nearest_occluder(self, target_pos):
+        """
+        找最近的 occluder (挡在 target 前面的)。
+        OccluBench 的 occluder 保证在 target 前方，直接取最近的。
+        """
+        occluders = self.get_occluder_objects()
+        if not occluders:
             return None
-        objects = self.get_all_object_poses()
-        if not objects: return None
-        best = min(objects, key=lambda o: np.linalg.norm(o['pos'][:2] - gp[:2]))
-        return best
+        # 按到 target 的距离排序 (最靠近 target 的 = 最需要先推开的)
+        occluders.sort(key=lambda o: np.linalg.norm(o['pos'][:2] - target_pos[:2]))
+        return occluders[0]
 
-    def find_occluder(self, target_pos):
-        """找挡在 target 前面(y 更小=更靠近机器人)的物体"""
-        tgt = self.get_target_object()
-        target_name = tgt['name'] if tgt else None
-        candidates = []
-        for obj in self.get_all_object_poses():
-            if target_name and obj['name'] == target_name:
-                continue
-            dy = target_pos[1] - obj['pos'][1]   # >0 means obj is closer to robot
-            dx = abs(target_pos[0] - obj['pos'][0])
-            if dy > 0.02 and dx < 0.12:
-                candidates.append({**obj, 'score': dy / (dx + 0.01)})
-        if not candidates: return None
-        return max(candidates, key=lambda c: c['score'])
+    # ── 图像提取 (按相机分开) ────────────────────────────────────
+    def get_images(self, obs) -> dict:
+        """
+        返回: {
+            'shoulder_camera': {'rgb': (H,W,3) uint8, 'depth': (H,W,1)},
+            'hand_camera':     {'rgb': (H,W,3) uint8, 'depth': (H,W,1)},
+        }
+        """
+        result = {}
+        sensor_data = obs.get('sensor_data', {})
 
-    # ── 图像提取 ─────────────────────────────────────────────────
-    def get_images(self, obs):
-        images = {}
-        for cam, data in obs.get('sensor_data', {}).items():
-            if not isinstance(data, dict): continue
-            if 'rgb' in data:
-                rgb = to_np(data['rgb'])
-                if rgb.ndim == 4: rgb = rgb[0]
-                if rgb.max() <= 1.0 and rgb.dtype in [np.float32, np.float64]:
-                    rgb = (rgb * 255).astype(np.uint8)
-                else:
-                    rgb = rgb.astype(np.uint8)
-                images[f'{cam}_rgb'] = rgb
-            if 'depth' in data:
-                d = to_np(data['depth'])
-                if d.ndim == 4: d = d[0]
-                images[f'{cam}_depth'] = d
-        return images
+        # 1) 从 ManiSkill sensor_data 读取 (shoulder_camera 等)
+        for cam_name in self._available_cams:
+            if cam_name in sensor_data:
+                data = sensor_data[cam_name]
+                if not isinstance(data, dict):
+                    continue
+                cam_result = {}
+                if 'rgb' in data:
+                    rgb = to_np(data['rgb'])
+                    if rgb.ndim == 4: rgb = rgb[0]
+                    if rgb.max() <= 1.0 and rgb.dtype in [np.float32, np.float64]:
+                        rgb = (rgb * 255).astype(np.uint8)
+                    else:
+                        rgb = rgb.astype(np.uint8)
+                    if rgb.shape[-1] == 4:
+                        rgb = rgb[..., :3]
+                    cam_result['rgb'] = rgb
+                if 'depth' in data:
+                    depth = to_np(data['depth'])
+                    if depth.ndim == 4: depth = depth[0]
+                    cam_result['depth'] = depth
+                if cam_result:
+                    result[cam_name] = cam_result
+
+        return result
 
     def get_render_frame(self):
+        """第三人称 render view"""
         f = self.env.render()
         if isinstance(f, torch.Tensor): f = f.cpu().numpy()
         if f is not None and f.ndim == 4: f = f[0]
@@ -148,22 +206,24 @@ class OccluVLAEnv:
     def print_scene(self):
         ee = self.get_ee_pos()
         tgt = self.get_target_object()
+        occs = self.get_occluder_objects()
         objs = self.get_all_object_poses()
+
         print(f"  EE:      [{ee[0]:.3f}, {ee[1]:.3f}, {ee[2]:.3f}]")
-        if tgt:
-            print(f"  Target:  {tgt['name']} [{tgt['pos'][0]:.3f}, {tgt['pos'][1]:.3f}, {tgt['pos'][2]:.3f}]")
-            occ = self.find_occluder(tgt['pos'])
-            if occ:
-                print(f"  Occluder:{occ['name']} [{occ['pos'][0]:.3f}, {occ['pos'][1]:.3f}, {occ['pos'][2]:.3f}]")
-            else:
-                print(f"  Occluder: None")
+        print(f"  Cameras: {self._available_cams}")
+        print(f"  Target:  {tgt['name']} (ycb={tgt['ycb_id']}) "
+              f"[{tgt['pos'][0]:.3f}, {tgt['pos'][1]:.3f}, {tgt['pos'][2]:.3f}]")
+        for oc in occs:
+            print(f"  Occluder:{oc['name']} (ycb={oc['ycb_id']}) "
+                  f"[{oc['pos'][0]:.3f}, {oc['pos'][1]:.3f}, {oc['pos'][2]:.3f}]")
         for o in objs:
-            tag = " ← TARGET" if (tgt and o['name'] == tgt['name']) else ""
-            print(f"    {o['name']:30s} [{o['pos'][0]:.3f}, {o['pos'][1]:.3f}, {o['pos'][2]:.3f}]{tag}")
+            tag = " ← TARGET" if o['name'] == tgt['name'] else ""
+            print(f"    {o['name']:30s} "
+                  f"[{o['pos'][0]:.3f}, {o['pos'][1]:.3f}, {o['pos'][2]:.3f}]{tag}")
 
 
 class ScriptedPushGraspPolicy:
-    """Closed-loop push-then-grasp policy"""
+    """Closed-loop push-then-grasp scripted policy"""
 
     APPROACH_H   = 0.10
     PUSH_H       = 0.01

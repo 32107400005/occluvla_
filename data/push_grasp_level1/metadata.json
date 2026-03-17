@@ -1,0 +1,16 @@
+{
+  "env_id": "OccluBench-Level1-v0",
+  "level": 1,
+  "num_episodes": 5,
+  "completed": 5,
+  "success_rate": 0.0,
+  "push_grasp_count": 5,
+  "direct_grasp_count": 0,
+  "cameras": [
+    "shoulder_camera",
+    "hand_camera"
+  ],
+  "render_size": 256,
+  "failed_seeds": [],
+  "time_sec": 43.48225140571594
+}
