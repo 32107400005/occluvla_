@@ -1,220 +1,169 @@
 """
-OccluVLA - 生成 ~100 条 push-then-grasp 演示轨迹 (修正版)
+OccluVLA - 生成 push-then-grasp 演示轨迹
 
-核心修正:
-1. Closed-loop 控制: 每步读取真实 EE 位置, 计算 delta
-2. 从仿真中读取目标/遮挡物的真实 pose
-3. 512x512 高分辨率渲染
-4. 结构化场景 (而非完全随机)
-5. 自动语言标注
+特性:
+  - Closed-loop: 每步从仿真读取真实 EE 位置
+  - 从 env.unwrapped.target_object 读取 target
+  - 自动检测 occluder 并规划 push 方向
+  - 同时录制 base_camera + render_view
+  - 语言标注包含物体名称
+  - 混合数据: 有 occluder → push+grasp, 无 occluder → direct grasp
 
 用法:
-    python generate_demos.py --num_episodes 100 --save_video
-    python generate_demos.py --num_episodes 5 --save_video --debug
+    python generate_demos.py --num 5 --debug          # 调试
+    python generate_demos.py --num 100 --save_video   # 正式
 """
 
-import os
-import sys
-import json
-import time
-import argparse
+import os, sys, json, time, argparse
 import numpy as np
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from push_grasp_env import PushGraspSceneManager, ScriptedPushGraspPolicy
-
-import torch
+from push_grasp_env import OccluVLAEnv, ScriptedPushGraspPolicy, to_np
 
 
-# ── 场景配置 ─────────────────────────────────────────────────────────
-# Level 1: 1 target + 1 occluder in front + 2 distractors
-# 物体在桌面上的典型 xy 范围 (ManiSkill3 PickSingleYCB 坐标系)
-# 你需要根据实际运行结果微调这些范围
-
-TARGET_XY_RANGE   = [(-0.05, 0.05), (-0.05, 0.05)]   # target 的 xy 范围
-OCCLUDER_OFFSET_Y = (-0.08, -0.05)                     # occluder 在 target 前方 (y 更小)
-OCCLUDER_OFFSET_X = (-0.02, 0.02)                      # occluder 的 x 偏移
-TABLE_Z           = 0.02                                # 物体的大致 z 高度
-
-# 语言模板
-LANGUAGE_TEMPLATES = [
-    "push the blocking object aside, then pick up the target object",
-    "move the occluding object out of the way and grasp the target",
-    "clear the obstacle by pushing it, then grab the target object",
-    "push away the object in front, then pick up the target",
-    "first push the blocking object to the side, then grasp the target",
+LANG_PUSH_GRASP = [
+    "push the {occ} aside, then pick up the {tgt}",
+    "move the {occ} out of the way and grasp the {tgt}",
+    "clear the {occ} by pushing, then grab the {tgt}",
+]
+LANG_DIRECT_GRASP = [
+    "pick up the {tgt}",
+    "grasp the {tgt} from the table",
+    "grab the {tgt}",
 ]
 
 
-def make_occluder_pos(target_pos, rng):
-    """在 target 前方生成一个 occluder 位置"""
-    offset_x = rng.uniform(*OCCLUDER_OFFSET_X)
-    offset_y = rng.uniform(*OCCLUDER_OFFSET_Y)
-    occluder_pos = target_pos.copy()
-    occluder_pos[0] += offset_x
-    occluder_pos[1] += offset_y
-    return occluder_pos
+def clean_name(raw_name):
+    """set_0_065-j_cups → cups (j)"""
+    # 去掉 set_N_ 前缀
+    name = raw_name
+    if name.startswith('set_'):
+        parts = name.split('_', 2)
+        if len(parts) >= 3:
+            name = parts[2]
+    # 简化 YCB 名称
+    name = name.replace('_', ' ')
+    return name
 
 
-def collect_episode(env_mgr, policy, seed, save_video=False, debug=False):
-    """
-    收集一条 push-then-grasp 演示轨迹.
-
-    核心流程:
-    1. Reset 环境, 获取真实物体位置
-    2. 规划 waypoint 序列
-    3. Closed-loop 执行: 每步读取 EE 位置 → 计算 delta → step
-
-    Returns:
-        episode_data: dict
-        success: bool
-        frames: list of RGB frames (for video)
-    """
+def collect_episode(env, policy, seed, save_video=False, debug=False):
     rng = np.random.RandomState(seed)
-    obs, info = env_mgr.reset(seed=seed)
-
-    # ── 1. 获取真实物体位置 ──────────────────────────────────────────
-    # 从仿真中读取 target 位置
-    target_pos = env_mgr.get_target_pos(obs)
-
-    if target_pos is None:
-        # Fallback: 如果无法读取, 尝试从 env.unwrapped 获取
-        print(f"  [seed={seed}] 无法从 obs 中获取 target 位置, 尝试 fallback...")
-        try:
-            scene = env_mgr.env.unwrapped
-            if hasattr(scene, 'obj'):
-                p = scene.obj.pose.p
-                if isinstance(p, torch.Tensor):
-                    p = p.cpu().numpy()
-                target_pos = p[0] if p.ndim > 1 else p
-        except Exception as e:
-            print(f"  [seed={seed}] Fallback 也失败: {e}")
-            return None, False, []
+    obs, info = env.reset(seed=seed)
 
     if debug:
-        print(f"  [seed={seed}] Target pos: {target_pos}")
-        env_mgr.inspect_obs_keys(obs)
+        print(f"\n  [seed={seed}] Scene:")
+        env.print_scene()
 
-    # ── 2. 确定 occluder 位置 ────────────────────────────────────────
-    # 在 PickSingleYCB 中只有一个目标物体, 没有额外的 occluder.
-    # 两种策略:
-    #   A) 如果你已经创建了自定义环境 (有多个物体), 从 scene 中读取
-    #   B) 如果用 PickSingleYCB, 我们假设一个 "虚拟" occluder 位置
-    #      来测试 scripted policy 的 push 轨迹规划是否正确
-    #      (push 阶段不会真的推到东西, 但 grasp 阶段是真实的)
-    #
-    # ⚠️ 重要: 要获得真正的 push-then-grasp 行为, 你最终需要:
-    #   - 自定义一个 ManiSkill3 环境, 场景中有多个物体
-    #   - 或者使用 PickClutterYCB 并从 scene 中识别哪个物体挡住了 target
-    #
-    # 这里我们先实现策略 B, 确保代码框架正确, 后续替换为策略 A
+    # ── 读取 target 和 occluder ──────────────────────────────────
+    tgt = env.get_target_object()
+    if tgt is None:
+        print(f"  [seed={seed}] Cannot find target, skipping")
+        return None, False, []
 
-    occluder_pos = make_occluder_pos(target_pos, rng)
+    target_pos = tgt['pos'].copy()
+    target_name = clean_name(tgt['name'])
 
-    if debug:
-        print(f"  [seed={seed}] Occluder pos: {occluder_pos}")
+    occluder = env.find_occluder(target_pos)
+    has_occluder = occluder is not None
 
-    # ── 3. 获取初始 EE 位置 ──────────────────────────────────────────
-    ee_pos = env_mgr.get_ee_pos(obs)
-    if debug:
-        print(f"  [seed={seed}] Initial EE pos: {ee_pos}")
-
-    # ── 4. 规划 waypoint 序列 ────────────────────────────────────────
-    waypoints = policy.plan_push_grasp(ee_pos, target_pos, occluder_pos)
+    if has_occluder:
+        occ_pos = occluder['pos'].copy()
+        occ_name = clean_name(occluder['name'])
+        lang = rng.choice(LANG_PUSH_GRASP).format(occ=occ_name, tgt=target_name)
+    else:
+        occ_pos = None
+        occ_name = None
+        lang = rng.choice(LANG_DIRECT_GRASP).format(tgt=target_name)
 
     if debug:
-        print(f"  [seed={seed}] Planned {len(waypoints)} waypoints:")
-        for i, wp in enumerate(waypoints):
-            print(f"    [{i}] {wp['label']}: {wp['target_xyz']}")
+        print(f"  Mode: {'push+grasp' if has_occluder else 'direct grasp'}")
+        print(f"  Language: {lang}")
 
-    # ── 5. Closed-loop 执行 ──────────────────────────────────────────
-    ep_rgb       = []
-    ep_depth     = []
-    ep_states    = []
-    ep_actions   = []
-    ep_rewards   = []
-    ep_phases    = []
-    frames       = []   # for video
+    # ── 规划 waypoints ───────────────────────────────────────────
+    ee_pos = env.get_ee_pos()
+    waypoints = policy.plan(ee_pos, target_pos, occ_pos)
 
-    max_steps_per_waypoint = 80
+    if debug:
+        for i, (phase, wp, grip, label) in enumerate(waypoints):
+            print(f"    WP[{i}] {phase:5s} {label:20s} → "
+                  f"[{wp[0]:.3f},{wp[1]:.3f},{wp[2]:.3f}] grip={grip}")
+
+    # ── Closed-loop 执行 ─────────────────────────────────────────
+    ep_data = {
+        'rgb_frames': [], 'render_frames': [], 'actions': [], 'states': [],
+        'phases': [], 'rewards': [],
+    }
+    max_steps_per_wp = 80
     total_steps = 0
-    terminated = False
-    truncated = False
 
-    for wp_idx, wp in enumerate(waypoints):
-        target_xyz = wp['target_xyz']
-        gripper_val = wp['gripper']
-        phase = wp['phase']
+    for wp_idx, (phase, target_xyz, gripper, label) in enumerate(waypoints):
 
-        # 如果是 "close gripper" waypoint, 原地等待几步
-        if wp['label'] == 'close gripper':
-            for _ in range(policy.GRIPPER_STEPS):
-                # 记录数据
-                imgs = env_mgr.get_images(obs)
+        if label == 'close':
+            # 闭合夹爪: 原地等待
+            for _ in range(policy.GRIP_WAIT):
+                imgs = env.get_images(obs)
                 for k, v in imgs.items():
-                    if "rgb" in k:
-                        ep_rgb.append(v)
-                        if save_video and "base" in k:
-                            frames.append(v)
-                    elif "depth" in k:
-                        ep_depth.append(v)
+                    if 'rgb' in k:
+                        ep_data['rgb_frames'].append(v)
 
-                state = env_mgr.get_robot_state(obs)
-                if state is not None:
-                    ep_states.append(state)
+                if save_video:
+                    rf = env.get_render_frame()
+                    if rf is not None:
+                        ep_data['render_frames'].append(rf)
 
-                action = np.zeros(env_mgr.action_dim)
-                action[-1] = gripper_val   # 只闭合夹爪
-                ep_actions.append(action)
-                ep_phases.append(phase)
+                qpos = env.get_qpos(obs)
+                if qpos is not None:
+                    ep_data['states'].append(qpos)
 
-                obs, reward, terminated, truncated, info = env_mgr.step(action)
-                r = reward.item() if isinstance(reward, torch.Tensor) else float(reward)
-                ep_rewards.append(r)
+                action = np.zeros(env.action_dim)
+                action[6] = gripper
+                ep_data['actions'].append(action)
+                ep_data['phases'].append(phase)
+
+                obs, reward, terminated, truncated, info = env.step(action)
+                ep_data['rewards'].append(
+                    reward.item() if isinstance(reward, torch.Tensor) else float(reward)
+                )
                 total_steps += 1
-
-                if terminated or truncated:
-                    break
+                if terminated or truncated: break
             continue
 
-        # 正常的移动 waypoint: closed-loop 逼近
-        for step_i in range(max_steps_per_waypoint):
-            # 记录当前帧数据
-            imgs = env_mgr.get_images(obs)
+        # 正常 waypoint: closed-loop 移动
+        for step_i in range(max_steps_per_wp):
+            # 记录
+            imgs = env.get_images(obs)
             for k, v in imgs.items():
-                if "rgb" in k:
-                    ep_rgb.append(v)
-                    if save_video and "base" in k:
-                        frames.append(v)
-                elif "depth" in k:
-                    ep_depth.append(v)
+                if 'rgb' in k:
+                    ep_data['rgb_frames'].append(v)
 
-            state = env_mgr.get_robot_state(obs)
-            if state is not None:
-                ep_states.append(state)
+            if save_video:
+                rf = env.get_render_frame()
+                if rf is not None:
+                    ep_data['render_frames'].append(rf)
 
-            # 读取当前 EE 位置 (closed-loop!)
-            current_ee = env_mgr.get_ee_pos(obs)
+            qpos = env.get_qpos(obs)
+            if qpos is not None:
+                ep_data['states'].append(qpos)
 
-            # 计算 action
-            action, reached = policy.compute_action(current_ee, target_xyz, gripper_val)
+            # Closed-loop: 读取当前真实 EE 位置
+            current_ee = env.get_ee_pos()
+            action, reached = policy.make_action(current_ee, target_xyz, gripper)
 
-            # 确保 action 维度正确
-            if len(action) < env_mgr.action_dim:
-                full_action = np.zeros(env_mgr.action_dim)
-                full_action[:len(action)] = action
-                action = full_action
-            elif len(action) > env_mgr.action_dim:
-                action = action[:env_mgr.action_dim]
+            # 确保维度
+            if len(action) < env.action_dim:
+                full = np.zeros(env.action_dim)
+                full[:len(action)] = action
+                action = full
 
-            ep_actions.append(action.copy())
-            ep_phases.append(phase)
+            ep_data['actions'].append(action.copy())
+            ep_data['phases'].append(phase)
 
-            # 执行
-            obs, reward, terminated, truncated, info = env_mgr.step(action)
-            r = reward.item() if isinstance(reward, torch.Tensor) else float(reward)
-            ep_rewards.append(r)
+            obs, reward, terminated, truncated, info = env.step(action)
+            import torch
+            ep_data['rewards'].append(
+                reward.item() if isinstance(reward, torch.Tensor) else float(reward)
+            )
             total_steps += 1
 
             if reached or terminated or truncated:
@@ -223,192 +172,141 @@ def collect_episode(env_mgr, policy, seed, save_video=False, debug=False):
         if terminated or truncated:
             break
 
-    # ── 6. 检查成功 ──────────────────────────────────────────────────
-    success = False
-    if isinstance(info, dict) and "success" in info:
-        s = info["success"]
-        success = bool(s.item() if isinstance(s, torch.Tensor) else s)
+    # ── 结果 ─────────────────────────────────────────────────────
+    success = env.get_success(info)
 
-    # ── 7. 语言标注 ──────────────────────────────────────────────────
-    language = rng.choice(LANGUAGE_TEMPLATES)
-
-    # ── 8. 打包数据 ──────────────────────────────────────────────────
-    episode_data = {
-        "rgb":      np.array(ep_rgb) if ep_rgb else np.array([]),
-        "depth":    np.array(ep_depth) if ep_depth else np.array([]),
-        "states":   np.array(ep_states) if ep_states else np.array([]),
-        "actions":  np.array(ep_actions) if ep_actions else np.array([]),
-        "rewards":  np.array(ep_rewards),
-        "phases":   np.array(ep_phases),
-        "language":  language,
-        "seed":      seed,
-        "num_steps": total_steps,
-        "success":   success,
-        "target_pos":   target_pos,
-        "occluder_pos": occluder_pos,
+    episode = {
+        'rgb':      np.array(ep_data['rgb_frames']) if ep_data['rgb_frames'] else np.array([]),
+        'actions':  np.array(ep_data['actions']) if ep_data['actions'] else np.array([]),
+        'states':   np.array(ep_data['states']) if ep_data['states'] else np.array([]),
+        'rewards':  np.array(ep_data['rewards']),
+        'phases':   np.array(ep_data['phases']),
+        'language':  lang,
+        'seed':      seed,
+        'num_steps': total_steps,
+        'success':   success,
+        'has_occluder': has_occluder,
+        'target_name': tgt['name'],
+        'target_pos':  target_pos,
+        'occluder_name': occluder['name'] if occluder else '',
+        'occluder_pos':  occ_pos if occ_pos is not None else np.zeros(3),
     }
 
-    return episode_data, success, frames
+    render_frames = ep_data['render_frames'] if save_video else []
+    return episode, success, render_frames
+
+
+def save_video(frames, path, fps=15):
+    if not frames: return
+    try:
+        import imageio
+        arr = np.array(frames)
+        if arr.dtype != np.uint8:
+            arr = arr.astype(np.uint8)
+        imageio.mimsave(str(path), arr, fps=fps)
+    except Exception as e:
+        print(f"  [!] Video save failed: {e}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OccluVLA push-then-grasp demo generation")
-    parser.add_argument("--num_episodes", type=int, default=100,
-                        help="Number of episodes to generate")
-    parser.add_argument("--save_video", action="store_true",
-                        help="Save MP4 videos for visualization")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num", type=int, default=100)
+    parser.add_argument("--save_video", action="store_true")
     parser.add_argument("--start_seed", type=int, default=0)
-    parser.add_argument("--render_size", type=int, default=512,
-                        help="Render resolution (width=height)")
-    parser.add_argument("--debug", action="store_true",
-                        help="Print detailed debug info for first few episodes")
-    parser.add_argument("--output_dir", type=str, default=None,
-                        help="Output directory (default: ../data/push_grasp_demos)")
+    parser.add_argument("--render_size", type=int, default=512)
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--output_dir", type=str, default=None)
     args = parser.parse_args()
 
-    # ── 路径设置 ─────────────────────────────────────────────────────
     if args.output_dir:
-        output_dir = Path(args.output_dir)
+        out_dir = Path(args.output_dir)
     else:
-        output_dir = Path(__file__).parent.parent / "data" / "push_grasp_demos"
-    vis_dir = Path(__file__).parent.parent / "data" / "visualizations"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    vis_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(__file__).parent.parent / "data" / "push_grasp_demos"
+    vid_dir = Path(__file__).parent.parent / "data" / "visualizations"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    vid_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("  OccluVLA: Push-Then-Grasp Demo Generation")
+    print(f"  Episodes: {args.num} | Video: {args.save_video}")
+    print(f"  Render: {args.render_size} | Debug: {args.debug}")
     print("=" * 60)
-    print(f"  Episodes: {args.num_episodes}")
-    print(f"  Render:   {args.render_size}x{args.render_size}")
-    print(f"  Video:    {'Yes' if args.save_video else 'No'}")
-    print(f"  Output:   {output_dir}")
-    print()
 
-    # ── 创建环境和策略 ───────────────────────────────────────────────
-    env_mgr = PushGraspSceneManager(
-        num_envs=1,
-        render_size=args.render_size,
-        control_mode="pd_ee_delta_pose",
-    )
+    env = OccluVLAEnv(num_envs=1, render_size=args.render_size)
     policy = ScriptedPushGraspPolicy()
 
-    # ── 首次运行: 检查 obs 结构 ──────────────────────────────────────
-    print("\n[检查] 探查 obs 结构...")
-    test_obs, test_info = env_mgr.reset(seed=42)
-    env_mgr.inspect_obs_keys(test_obs)
-
-    test_ee = env_mgr.get_ee_pos(test_obs)
-    test_tgt = env_mgr.get_target_pos(test_obs)
-    print(f"\n  EE position:     {test_ee}")
-    print(f"  Target position: {test_tgt}")
-
-    test_imgs = env_mgr.get_images(test_obs)
-    for k, v in test_imgs.items():
-        print(f"  Image '{k}': shape={v.shape}, dtype={v.dtype}")
-
-    print()
-
-    # ── 主循环: 生成轨迹 ─────────────────────────────────────────────
     total_success = 0
-    total_steps   = 0
-    failed_seeds  = []
-    start_time    = time.time()
+    total_push_grasp = 0
+    total_direct = 0
+    failed = []
+    t0 = time.time()
 
-    for i in range(args.num_episodes):
+    import torch  # for reward handling
+
+    for i in range(args.num):
         seed = args.start_seed + i
-        do_debug = args.debug and i < 3   # 前3条打印详细信息
+        do_debug = args.debug and i < 3
 
-        ep_data, success, frames = collect_episode(
-            env_mgr, policy, seed,
+        ep, success, frames = collect_episode(
+            env, policy, seed,
             save_video=args.save_video,
             debug=do_debug,
         )
 
-        if ep_data is None:
-            print(f"  [!] Episode {i} (seed={seed}) FAILED - skipping")
-            failed_seeds.append(seed)
+        if ep is None:
+            failed.append(seed)
             continue
 
-        # 保存数据
-        np.savez_compressed(
-            output_dir / f"episode_{i:04d}.npz",
-            **{k: v for k, v in ep_data.items()
-               if isinstance(v, (np.ndarray, str, int, float, bool))}
-        )
+        # 保存 npz
+        save_dict = {}
+        for k, v in ep.items():
+            if isinstance(v, np.ndarray):
+                save_dict[k] = v
+            elif isinstance(v, (str, int, float, bool)):
+                save_dict[k] = v
+        np.savez_compressed(out_dir / f"episode_{i:04d}.npz", **save_dict)
 
-        # 保存视频 (512x512 MP4)
-        if args.save_video and frames and len(frames) > 0:
-            try:
-                import imageio.v3 as iio
-                video_path = vis_dir / f"episode_{i:04d}.mp4"
-                # 确保帧尺寸一致
-                frames_arr = np.array(frames)
-                iio.imwrite(
-                    str(video_path),
-                    frames_arr,
-                    fps=15,
-                    codec="libx264",
-                    plugin="pyav",
-                )
-            except ImportError:
-                try:
-                    import imageio
-                    imageio.mimsave(
-                        str(vis_dir / f"episode_{i:04d}.mp4"),
-                        frames, fps=15
-                    )
-                except Exception as e:
-                    print(f"  [!] 保存视频失败: {e}")
+        # 保存视频 (render view, 512x512)
+        if args.save_video and frames:
+            save_video(frames, vid_dir / f"episode_{i:04d}.mp4")
 
         total_success += int(success)
-        total_steps   += ep_data["num_steps"]
+        if ep['has_occluder']:
+            total_push_grasp += 1
+        else:
+            total_direct += 1
 
-        # 进度报告
-        elapsed = time.time() - start_time
+        elapsed = time.time() - t0
         speed = (i + 1) / elapsed
-        eta = (args.num_episodes - i - 1) / speed if speed > 0 else 0
-
         if (i + 1) % 10 == 0 or i == 0 or do_debug:
-            print(
-                f"  [{i+1:3d}/{args.num_episodes}]  "
-                f"steps={ep_data['num_steps']:3d}  "
-                f"success={success}  "
-                f"speed={speed:.1f} ep/s  "
-                f"ETA={eta:.0f}s"
-            )
+            print(f"  [{i+1:3d}/{args.num}] steps={ep['num_steps']:3d} "
+                  f"{'push+grasp' if ep['has_occluder'] else 'direct    '} "
+                  f"success={success} {speed:.1f}ep/s")
 
-    env_mgr.close()
+    env.close()
 
-    # ── 保存元数据 ───────────────────────────────────────────────────
-    completed = args.num_episodes - len(failed_seeds)
-    metadata = {
-        "num_episodes":    args.num_episodes,
-        "completed":       completed,
-        "total_success":   total_success,
-        "success_rate":    total_success / completed if completed > 0 else 0,
-        "avg_steps":       total_steps / completed if completed > 0 else 0,
-        "total_time_sec":  time.time() - start_time,
-        "render_size":     args.render_size,
-        "control_mode":    "pd_ee_delta_pose",
-        "failed_seeds":    failed_seeds,
+    # 元数据
+    done = args.num - len(failed)
+    meta = {
+        "num_episodes": args.num,
+        "completed": done,
+        "success_rate": total_success / done if done > 0 else 0,
+        "push_grasp_count": total_push_grasp,
+        "direct_grasp_count": total_direct,
+        "failed_seeds": failed,
+        "render_size": args.render_size,
+        "time_sec": time.time() - t0,
     }
-    with open(output_dir / "metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
+    json.dump(meta, open(out_dir / "metadata.json", "w"), indent=2)
 
-    # ── 汇总 ─────────────────────────────────────────────────────────
-    print()
-    print("=" * 60)
-    print(f"  ✅ 完成!")
-    print(f"  总轨迹:   {completed} / {args.num_episodes}")
-    print(f"  成功率:   {metadata['success_rate']:.1%}")
-    print(f"  平均步数: {metadata['avg_steps']:.1f}")
-    print(f"  总耗时:   {metadata['total_time_sec']:.1f}s")
-    print(f"  数据:     {output_dir}")
+    print(f"\n{'='*60}")
+    print(f"  Done! {done}/{args.num} episodes")
+    print(f"  Success: {total_success}/{done} = {meta['success_rate']:.1%}")
+    print(f"  Push+grasp: {total_push_grasp} | Direct: {total_direct}")
+    print(f"  Data: {out_dir}")
     if args.save_video:
-        print(f"  视频:     {vis_dir}")
-    if failed_seeds:
-        print(f"  失败 seed: {failed_seeds}")
-    print("=" * 60)
+        print(f"  Video: {vid_dir}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

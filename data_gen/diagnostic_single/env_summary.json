@@ -1,0 +1,6 @@
+{
+  "ee_pos": "env.unwrapped.agent.tcp.pose.p",
+  "target_pos": "env.unwrapped.obj.pose.p",
+  "target_name": "ycb_object",
+  "action_dim": 7
+}
